@@ -24,10 +24,38 @@ import type {
 	JsonObject,
 	INodeExecutionData,
 } from 'n8n-workflow';
-import { NodeConnectionTypes, NodeOperationError, TriggerCloseError } from 'n8n-workflow';
-import rfc2047 from 'rfc2047';
+import { NodeConnectionTypes, NodeOperationError, OperationalError } from 'n8n-workflow';
 
 import { getNewEmails } from './utils';
+
+/** After this, a forced reconnect is reported so n8n can re-activate the trigger. */
+const RECONNECT_TIMEOUT = 45_000;
+
+/** How often IDLE is broken and restarted, and so the longest a healthy connection stays silent. */
+const IDLE_INTERVAL = 120_000;
+
+/**
+ * How long a silent server is tolerated once IDLE has been broken. Worst-case
+ * detection is therefore `IDLE_INTERVAL + INACTIVITY_TIMEOUT`.
+ */
+const INACTIVITY_TIMEOUT = 120_000;
+
+const withTimeout = async <T>(operation: Promise<T>, ms: number, message: string): Promise<T> => {
+	let timer: NodeJS.Timeout | undefined;
+	try {
+		return await Promise.race([
+			operation,
+			new Promise<never>((_, reject) => {
+				timer = setTimeout(() => reject(new OperationalError(message)), ms);
+			}),
+		]);
+	} finally {
+		clearTimeout(timer);
+	}
+};
+
+const toError = (value: unknown): Error =>
+	value instanceof Error ? value : new Error(String(value));
 
 const versionDescription: INodeTypeDescription = {
 	displayName: 'Email Trigger (IMAP)',
@@ -174,7 +202,8 @@ const versionDescription: INodeTypeDescription = {
 					name: 'forceReconnect',
 					type: 'number',
 					default: 60,
-					description: 'Sets an interval (in minutes) to force a reconnection',
+					description:
+						'Not needed for reliability, as the connection is monitored and re-established automatically. Only useful for servers that enforce a maximum connection age.',
 				},
 				{
 					displayName: 'Fetch Only New Emails',
@@ -284,9 +313,8 @@ export class EmailReadImapV2 implements INodeType {
 
 		let connection: ImapSimple;
 		let closeFunctionWasCalled = false;
-		let isCurrentlyReconnecting = false;
-
-		// Returns the email text
+		/** Connections the node itself threw away; their `close` is expected, not a failure. */
+		const discardedConnections = new WeakSet<ImapSimple>();
 
 		const getText = async (
 			parts: MessagePart[],
@@ -316,7 +344,6 @@ export class EmailReadImapV2 implements INodeType {
 			}
 		};
 
-		// Returns the email attachments
 		const getAttachment = async (
 			imapConnection: ImapSimple,
 			parts: MessagePart[],
@@ -331,26 +358,13 @@ export class EmailReadImapV2 implements INodeType {
 				(part) => part.disposition?.type?.toUpperCase() === 'ATTACHMENT',
 			);
 
-			const decodeFilename = (filename: string) => {
-				const regex = /=\?([\w-]+)\?Q\?.*\?=/i;
-				if (regex.test(filename)) {
-					return rfc2047.decode(filename);
-				}
-				return filename;
-			};
-
 			const attachmentPromises = [];
 			let attachmentPromise;
 			for (const attachmentPart of attachmentParts) {
 				attachmentPromise = imapConnection
 					.getPartData(message, attachmentPart)
 					.then(async (partData) => {
-						// if filename contains utf-8 encoded characters, decode it
-						const fileName = decodeFilename(
-							((attachmentPart.disposition as IDataObject)?.params as IDataObject)
-								?.filename as string,
-						);
-						// Return it in the format n8n expects
+						const fileName = attachmentPart.disposition?.params?.filename;
 						return await this.helpers.prepareBinaryData(partData.buffer, fileName);
 					});
 
@@ -380,7 +394,9 @@ export class EmailReadImapV2 implements INodeType {
 					port: credentials.port,
 					tls: credentials.secure,
 					authTimeout: 20000,
+					idleInterval: IDLE_INTERVAL,
 				},
+				inactivityTimeout: INACTIVITY_TIMEOUT,
 				onMail: async (numEmails) => {
 					this.logger.debug('New emails received in node "EmailReadImap"', {
 						numEmails,
@@ -445,8 +461,8 @@ export class EmailReadImapV2 implements INodeType {
 						}
 					}
 				},
-				onUpdate: (seqNo: number, info) => {
-					this.logger.debug(`Email Read Imap:update ${seqNo}`, info);
+				onUpdate: (info) => {
+					this.logger.debug(`Email Read Imap:update ${info.seq}`, { uid: info.uid });
 				},
 			};
 
@@ -464,22 +480,20 @@ export class EmailReadImapV2 implements INodeType {
 				config.imap.tlsOptions = tlsOptions;
 			}
 
-			// Connect to the IMAP server and open the mailbox
-			// that we get informed whenever a new email arrives
 			return await imapConnect(config).then((conn) => {
 				let errorReported = false;
 
-				conn.on('close', (_hadError: boolean) => {
-					if (isCurrentlyReconnecting) {
-						this.logger.debug('Email Read Imap: Connected closed for forced reconnecting');
-					} else if (closeFunctionWasCalled) {
+				conn.on('close', () => {
+					if (closeFunctionWasCalled) {
 						this.logger.debug('Email Read Imap: Shutting down workflow - connected closed');
+					} else if (discardedConnections.has(conn)) {
+						this.logger.debug('Email Read Imap: Connected closed for forced reconnecting');
 					} else if (!errorReported) {
 						this.logger.error('Email Read Imap: Connected closed unexpectedly');
 						this.emitError(
 							new NodeOperationError(this.getNode(), 'IMAP connection closed unexpectedly', {
 								description:
-									'The IMAP server closed the connection without reporting an error, usually because the server (or a proxy/firewall) periodically closes long-lived connections, or was temporarily unavailable. n8n will automatically retry reactivating the workflow. If this happens on a regular cycle, enable the "Force Reconnect" option with an interval shorter than that cycle, so n8n reconnects before the server does.',
+									'The IMAP server closed the connection without reporting an error, usually because the server (or a proxy/firewall) periodically closes long-lived connections, or was temporarily unavailable. n8n will automatically retry reactivating the workflow.',
 							}),
 						);
 					}
@@ -502,42 +516,68 @@ export class EmailReadImapV2 implements INodeType {
 
 		await connection.openBox(mailbox);
 
-		let reconnectionInterval: NodeJS.Timeout | undefined;
+		let reconnectionTimer: NodeJS.Timeout | undefined;
+		let reconnectAttempt = 0;
 
-		const handleReconnect = async () => {
-			this.logger.debug('Forcing reconnect to IMAP server');
+		/** Never rejects; `end()` is reached even when the server is unresponsive. */
+		const disconnect = async (target: ImapSimple) => {
+			discardedConnections.add(target);
 			try {
-				isCurrentlyReconnecting = true;
-				if (connection.closeBox) await connection.closeBox(false);
-				connection.end();
-				connection = await establishConnection();
-				await connection.openBox(mailbox);
+				target.end();
 			} catch (error) {
-				this.logger.error(error as string);
-			} finally {
-				isCurrentlyReconnecting = false;
+				this.logger.warn('Email Read Imap: Could not end the connection cleanly', {
+					error: toError(error),
+				});
 			}
 		};
 
+		const reconnect = async (attempt: number) => {
+			await disconnect(connection);
+			const fresh = await establishConnection();
+			// A timed-out attempt keeps running; its late connection must not replace a newer one.
+			if (attempt !== reconnectAttempt || closeFunctionWasCalled) {
+				await disconnect(fresh);
+				return;
+			}
+			connection = fresh;
+			await connection.openBox(mailbox);
+		};
+
+		const handleReconnect = async () => {
+			reconnectAttempt += 1;
+			this.logger.debug('Forcing reconnect to IMAP server');
+			try {
+				await withTimeout(
+					reconnect(reconnectAttempt),
+					RECONNECT_TIMEOUT,
+					'Reconnecting to the IMAP server timed out',
+				);
+			} catch (error) {
+				this.logger.error('Email Read Imap: Forced reconnect failed', { error: toError(error) });
+				this.emitError(toError(error));
+			}
+		};
+
+		// Rearmed only once an attempt has settled, so a slow or abandoned reconnect
+		// can never stack up behind the next tick.
+		const scheduleForcedReconnect = (interval: number) => {
+			reconnectionTimer = setTimeout(() => {
+				void handleReconnect().then(() => {
+					if (!closeFunctionWasCalled) scheduleForcedReconnect(interval);
+				});
+			}, interval);
+		};
+
 		if (options.forceReconnect !== undefined) {
-			reconnectionInterval = setInterval(
-				handleReconnect,
-				(options.forceReconnect as number) * 1000 * 60,
-			);
+			scheduleForcedReconnect((options.forceReconnect as number) * 1000 * 60);
 		}
 
-		// When workflow and so node gets set to inactive close the connection
+		// An unreachable mail server must never be able to block deactivation, so
+		// teardown failures are logged instead of thrown.
 		const closeFunction = async () => {
 			closeFunctionWasCalled = true;
-			if (reconnectionInterval) {
-				clearInterval(reconnectionInterval);
-			}
-			try {
-				if (connection.closeBox) await connection.closeBox(false);
-				connection.end();
-			} catch (error) {
-				throw new TriggerCloseError(this.getNode(), { cause: error as Error, level: 'warning' });
-			}
+			clearTimeout(reconnectionTimer);
+			await disconnect(connection);
 		};
 
 		// Resolve returned-promise so that waiting errors can be emitted

@@ -13,4 +13,17 @@ export default defineConfig(baseConfig, {
 		'@typescript-eslint/no-floating-promises': 'warn',
 		'import-x/order': 'warn',
 	},
+},
+{
+	// IMAP atoms and header field names are protocol identifiers, not code ones.
+	files: ['src/search-criteria.ts', 'src/search-criteria.test.ts', 'src/headers.test.ts'],
+	rules: { '@typescript-eslint/naming-convention': 'off' },
+},
+{
+	// Mocks mirror the exported names and async shapes of what they replace.
+	files: ['src/index.test.ts', 'src/imap-simple.test.ts'],
+	rules: {
+		'@typescript-eslint/naming-convention': 'off',
+		'@typescript-eslint/require-await': 'off',
+	},
 });

@@ -1,100 +1,86 @@
-/* eslint-disable @typescript-eslint/no-unsafe-member-access */
+import { ImapFlow, type MessageStructureObject } from 'imapflow';
+import { Socket } from 'net';
 
-import Imap from 'imap';
-
-import { ConnectionClosedError, ConnectionEndedError, ConnectionTimeoutError } from './errors';
+import { toMessageParts } from './body-structure';
+import { ConnectionLostError } from './errors';
 import { ImapSimple } from './imap-simple';
 import type { ImapSimpleOptions, MessagePart } from './types';
 
 /**
- * Connect to an Imap server, returning an ImapSimple instance, which is a wrapper over node-imap to simplify it's api for common use cases.
+ * A quarter beyond imapflow's own worst case (`idleInterval + inactivityTimeout`),
+ * so the backstop only ever fires second, and still leaves multiples of the
+ * `idleInterval` at which a healthy connection speaks.
  */
-export async function connect(options: ImapSimpleOptions): Promise<ImapSimple> {
-	const authTimeout = options.imap.authTimeout ?? 2000;
-	options.imap.authTimeout = authTimeout;
+const BACKSTOP_FACTOR = 1.25;
 
-	const imap = new Imap(options.imap);
-
-	return await new Promise<ImapSimple>((resolve, reject) => {
-		const cleanUp = () => {
-			imap.removeListener('ready', imapOnReady);
-			imap.removeListener('error', imapOnError);
-			imap.removeListener('close', imapOnClose);
-			imap.removeListener('end', imapOnEnd);
-		};
-
-		const imapOnReady = () => {
-			cleanUp();
-			resolve(new ImapSimple(imap));
-		};
-
-		const imapOnError = (e: Error & { source?: string }) => {
-			if (e.source === 'timeout-auth') {
-				e = new ConnectionTimeoutError(authTimeout);
-			}
-
-			cleanUp();
-			reject(e);
-		};
-
-		const imapOnEnd = () => {
-			cleanUp();
-			reject(new ConnectionEndedError());
-		};
-
-		const imapOnClose = () => {
-			cleanUp();
-			reject(new ConnectionClosedError());
-		};
-
-		imap.once('ready', imapOnReady);
-		imap.once('error', imapOnError);
-		imap.once('close', imapOnClose);
-		imap.once('end', imapOnEnd);
-
-		if (options.onMail) {
-			imap.on('mail', options.onMail);
-		}
-
-		if (options.onExpunge) {
-			imap.on('expunge', options.onExpunge);
-		}
-
-		if (options.onUpdate) {
-			imap.on('update', options.onUpdate);
-		}
-
-		imap.connect();
-	});
+/** imapflow does not declare its socket, and a TLSSocket satisfies this too. */
+function socketOf(client: ImapFlow): Socket | undefined {
+	if (!('socket' in client)) return undefined;
+	const { socket } = client;
+	return socket instanceof Socket ? socket : undefined;
 }
 
 /**
- * Given the `message.attributes.struct`, retrieve a flattened array of `parts` objects that describe the structure of
- * the different parts of the message's body. Useful for getting a simple list to iterate for the purposes of,
- * for example, finding all attachments.
+ * Bounds the one silence imapflow does not.
  *
- * Code taken from http://stackoverflow.com/questions/25247207/how-to-read-and-save-attachments-using-node-imap
- *
- * @returns {Array} a flattened array of `parts` objects that describe the structure of the different parts of the
- *  message's body
+ * Its `socketTimeout` recovers a stalled connection by running a NOOP, but a NOOP
+ * queues behind the IDLE it is meant to rescue. That is fine once `maxIdleTime`
+ * breaks IDLE — the DONE goes out and the timeout fires against it — but if the
+ * connection dies after IDLE is written and before the server confirms it, nothing
+ * ever settles and the stall is silent and permanent.
  */
-export function getParts(
-	/** The `message.attributes.struct` value from the message you wish to retrieve parts for. */
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	struct: any,
-	/** The list of parts to push to. */
-	parts: MessagePart[] = [],
-): MessagePart[] {
-	for (let i = 0; i < struct.length; i++) {
-		if (Array.isArray(struct[i])) {
-			getParts(struct[i], parts);
-		} else if (struct[i].partID) {
-			parts.push(struct[i] as MessagePart);
-		}
-	}
-	return parts;
+function watchForInactivity(client: ImapFlow, socket: Socket, timeout: number) {
+	let timer: NodeJS.Timeout | undefined;
+
+	const stop = () => clearTimeout(timer);
+	const restart = () => {
+		clearTimeout(timer);
+		timer = setTimeout(() => {
+			client.emit('error', new ConnectionLostError(timeout));
+			client.close();
+		}, timeout);
+	};
+
+	socket.on('data', restart);
+	socket.once('close', stop);
+	socket.once('end', stop);
+
+	restart();
 }
 
+export async function connect(options: ImapSimpleOptions): Promise<ImapSimple> {
+	const { imap } = options;
+
+	const client = new ImapFlow({
+		host: imap.host,
+		port: imap.port,
+		secure: imap.tls ?? false,
+		tls: imap.tlsOptions,
+		auth: { user: imap.user, pass: imap.password },
+		maxIdleTime: imap.idleInterval,
+		socketTimeout: options.inactivityTimeout,
+		connectionTimeout: imap.authTimeout,
+		greetingTimeout: imap.authTimeout,
+		logger: false,
+	});
+
+	await client.connect();
+
+	const { idleInterval } = imap;
+	const socket = socketOf(client);
+	if (idleInterval && options.inactivityTimeout && socket) {
+		const window = BACKSTOP_FACTOR * (idleInterval + options.inactivityTimeout);
+		watchForInactivity(client, socket, Math.round(window));
+	}
+
+	return new ImapSimple(client, options);
+}
+
+export function getParts(struct?: MessageStructureObject): MessagePart[] {
+	return struct ? toMessageParts(struct) : [];
+}
+
+export { type SearchCriteria } from './search-criteria';
 export * from './imap-simple';
 export * from './errors';
 export type * from './types';

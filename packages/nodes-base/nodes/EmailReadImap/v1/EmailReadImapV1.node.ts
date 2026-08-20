@@ -1,4 +1,10 @@
-import type { ImapSimple, ImapSimpleOptions, Message, SearchCriteria } from '@n8n/imap';
+import type {
+	FetchOptions,
+	ImapSimple,
+	ImapSimpleOptions,
+	Message,
+	SearchCriteria,
+} from '@n8n/imap';
 import { connect as imapConnect, getParts } from '@n8n/imap';
 import find from 'lodash/find';
 import isEmpty from 'lodash/isEmpty';
@@ -19,6 +25,7 @@ import type {
 	INodeTypeBaseDescription,
 	INodeTypeDescription,
 	ITriggerResponse,
+	JsonObject,
 } from 'n8n-workflow';
 
 export async function parseRawEmail(
@@ -56,6 +63,15 @@ export async function parseRawEmail(
 		binary: Object.keys(binaryData).length ? binaryData : undefined,
 	} as INodeExecutionData;
 }
+
+/** How often IDLE is broken and restarted, and so the longest a healthy connection stays silent. */
+const IDLE_INTERVAL = 120_000;
+
+/**
+ * How long a silent server is tolerated once IDLE has been broken. Worst-case
+ * detection is therefore `IDLE_INTERVAL + INACTIVITY_TIMEOUT`.
+ */
+const INACTIVITY_TIMEOUT = 120_000;
 
 const versionDescription: INodeTypeDescription = {
 	displayName: 'Email Trigger (IMAP)',
@@ -280,8 +296,6 @@ export class EmailReadImapV1 implements INodeType {
 
 		let connection: ImapSimple;
 
-		// Returns the email text
-
 		const getText = async (parts: any[], message: Message, subtype: string): Promise<string> => {
 			if (!message.attributes.struct) {
 				return '';
@@ -306,7 +320,6 @@ export class EmailReadImapV1 implements INodeType {
 			}
 		};
 
-		// Returns the email attachments
 		const getAttachment = async (
 			imapConnection: ImapSimple,
 			parts: any[],
@@ -318,7 +331,7 @@ export class EmailReadImapV1 implements INodeType {
 
 			// Check if the message has attachments and if so get them
 			const attachmentParts = parts.filter((part) => {
-				return part.disposition && part.disposition.type.toUpperCase() === 'ATTACHMENT';
+				return part.disposition?.type.toUpperCase() === 'ATTACHMENT';
 			});
 
 			const attachmentPromises = [];
@@ -330,7 +343,7 @@ export class EmailReadImapV1 implements INodeType {
 						// Return it in the format n8n expects
 						return await this.helpers.prepareBinaryData(
 							partData.buffer,
-							attachmentPart.disposition.params.filename as string,
+							attachmentPart.disposition?.params?.filename,
 						);
 					});
 
@@ -347,20 +360,12 @@ export class EmailReadImapV1 implements INodeType {
 		): Promise<INodeExecutionData[]> => {
 			const format = this.getNodeParameter('format', 0) as string;
 
-			let fetchOptions = {};
+			let fetchOptions: FetchOptions = {};
 
 			if (format === 'simple' || format === 'raw') {
-				fetchOptions = {
-					bodies: ['TEXT', 'HEADER'],
-					markSeen: false,
-					struct: true,
-				};
+				fetchOptions = { bodies: ['TEXT', 'HEADER'], struct: true };
 			} else if (format === 'resolved') {
-				fetchOptions = {
-					bodies: [''],
-					markSeen: false,
-					struct: true,
-				};
+				fetchOptions = { bodies: [''], struct: true };
 			}
 
 			const results = await imapConnection.search(searchCriteria, fetchOptions);
@@ -428,7 +433,7 @@ export class EmailReadImapV1 implements INodeType {
 					) {
 						staticData.lastMessageUid = message.attributes.uid;
 					}
-					const parts = getParts(message.attributes.struct!);
+					const parts = getParts(message.attributes.struct);
 
 					newEmail = {
 						json: {
@@ -525,7 +530,9 @@ export class EmailReadImapV1 implements INodeType {
 					port: credentials.port as number,
 					tls: credentials.secure as boolean,
 					authTimeout: 20000,
+					idleInterval: IDLE_INTERVAL,
 				},
+				inactivityTimeout: INACTIVITY_TIMEOUT,
 				onMail: async () => {
 					if (connection) {
 						if (staticData.lastMessageUid !== undefined) {
@@ -580,11 +587,10 @@ export class EmailReadImapV1 implements INodeType {
 				config.imap.tlsOptions = tlsOptions;
 			}
 
-			// Connect to the IMAP server and open the mailbox
-			// that we get informed whenever a new email arrives
 			return await imapConnect(config).then(async (conn) => {
 				conn.on('error', async (error) => {
-					const errorCode = error.code.toUpperCase();
+					const errorCode =
+						((error as JsonObject).code as string | undefined)?.toUpperCase() ?? 'UNKNOWN';
 					if (['ECONNRESET', 'EPIPE'].includes(errorCode as string)) {
 						this.logger.debug(`IMAP connection was reset (${errorCode}) - reconnecting.`, {
 							error,
@@ -624,7 +630,6 @@ export class EmailReadImapV1 implements INodeType {
 			);
 		}
 
-		// When workflow and so node gets set to inactive close the connectoin
 		async function closeFunction() {
 			if (reconnectionInterval) {
 				clearInterval(reconnectionInterval);

@@ -1,206 +1,157 @@
 import { EventEmitter } from 'events';
-import type Imap from 'imap';
-import { type ImapMessage } from 'imap';
+import type { ImapFlow, ListResponse, MailboxObject } from 'imapflow';
 
-import { getMessage } from './helpers/get-message';
+import { ConnectionLostError } from './errors';
+import { toFetchQuery, toMessageBodyParts } from './fetch';
 import { PartData } from './part-data';
-import type { Message, MessagePart, SearchCriteria } from './types';
+import { toSearchObject, type SearchCriteria } from './search-criteria';
+import type { FetchOptions, ImapSimpleOptions, Message, MessagePart } from './types';
 
-const IMAP_EVENTS = ['alert', 'mail', 'expunge', 'uidvalidity', 'update', 'close', 'end'] as const;
+const LOGOUT_GRACE_PERIOD = 2000;
+
+/** imapflow issues one sequential partial FETCH per chunk; its 64 KB default is a lot of round trips. */
+const DOWNLOAD_CHUNK_SIZE = 1024 * 1024;
 
 export class ImapSimple extends EventEmitter {
-	constructor(private readonly imap: Imap) {
+	private readonly onMail: ImapSimpleOptions['onMail'];
+
+	constructor(
+		private readonly client: ImapFlow,
+		options: Pick<ImapSimpleOptions, 'onMail' | 'onUpdate'> = {},
+	) {
 		super();
 
-		// pass most node-imap `Connection` events through 1:1
-		IMAP_EVENTS.forEach((event) => {
-			this.imap.on(event, this.emit.bind(this, event));
-		});
+		this.client.on('error', (error: Error) => this.emit('error', error));
+		this.client.on('close', () => this.emit('close'));
 
-		// forward error events from the underlying connection
-		this.imap.on('error', (e: Error) => {
-			this.emit('error', e);
-		});
-	}
-
-	/** disconnect from the imap server */
-	end(): void {
-		// Remove all forwarding listeners to prevent leaks on reconnect
-		this.imap.removeAllListeners();
-
-		// Suppress errors emitted during disconnect (e.g. ECONNRESET).
-		// This is a known node-imap issue with no upstream fix:
-		// https://github.com/mscdex/node-imap/issues/391
-		// https://github.com/mscdex/node-imap/issues/395
-		this.imap.on('error', () => {});
-
-		// Forward the final 'close' event so callers can still react
-		// (e.g. EmailReadImapV2 logs reconnect/shutdown status on close)
-		this.imap.once('close', (...args: unknown[]) => this.emit('close', ...args));
-
-		this.imap.end();
+		this.onMail = options.onMail;
+		if (options.onMail) {
+			this.client.on('exists', ({ count, prevCount }) => {
+				if (count > prevCount) this.notifyMail(count - prevCount);
+			});
+		}
+		if (options.onUpdate) this.client.on('flags', options.onUpdate);
 	}
 
 	/**
-	 * Search the currently open mailbox, and retrieve the results
-	 *
-	 * Results are in the form:
-	 *
-	 * [{
-	 *   attributes: object,
-	 *   parts: [ { which: string, size: number, body: string }, ... ]
-	 * }, ...]
-	 *
-	 * See node-imap's ImapMessage signature for information about `attributes`, `which`, `size`, and `body`.
-	 * For any message part that is a `HEADER`, the body is automatically parsed into an object.
+	 * `onMail` may be async, and its rejection has to reach the `error` channel the
+	 * caller listens on rather than escaping as an unhandled rejection.
 	 */
+	private notifyMail(count: number): void {
+		try {
+			void Promise.resolve(this.onMail?.(count)).catch((e: Error) => this.emit('error', e));
+		} catch (e) {
+			this.emit('error', e);
+		}
+	}
+
+	/**
+	 * imapflow settles some commands with a falsy value rather than rejecting when
+	 * the connection dies under them, which would otherwise read as an empty result.
+	 */
+	private assertRan<T>(result: T | false | undefined, command: string): T {
+		if (result === false || result === undefined) {
+			if (!this.client.usable) throw new ConnectionLostError();
+			throw new Error(`IMAP ${command} did not complete`);
+		}
+		return result;
+	}
+
+	/** A `HEADER` part's body comes back parsed into an object, the rest as sent. */
 	async search(
-		/** Criteria to use to search. Passed to node-imap's .search() 1:1 */
 		searchCriteria: SearchCriteria[],
-		/** Criteria to use to fetch the search results. Passed to node-imap's .fetch() 1:1 */
-		fetchOptions: Imap.FetchOptions,
-		/** Optional limit to restrict the number of messages fetched */
+		fetchOptions: FetchOptions,
+		/** Fetch at most this many of the oldest matches. */
 		limit?: number,
-	) {
-		return await new Promise<Message[]>((resolve, reject) => {
-			this.imap.search(searchCriteria, (e, uids) => {
-				if (e) {
-					reject(e);
-					return;
-				}
+	): Promise<Message[]> {
+		const found = await this.client.search(toSearchObject(searchCriteria), { uid: true });
+		const uids = this.assertRan(Array.isArray(found) ? found : undefined, 'SEARCH');
+		if (uids.length === 0) return [];
 
-				if (uids.length === 0) {
-					resolve([]);
-					return;
-				}
+		// oldest first, because imapflow returns SEARCH results in ascending UID order
+		const wanted = limit && limit > 0 ? uids.slice(0, limit) : uids;
+		const messages: Message[] = [];
 
-				// If limit is specified, take only the first N UIDs
-				let uidsToFetch = uids;
-				if (limit && limit > 0 && uids.length > limit) {
-					uidsToFetch = uids.slice(0, limit);
-				}
-
-				const fetch = this.imap.fetch(uidsToFetch, fetchOptions);
-				let messagesRetrieved = 0;
-				const messages: Message[] = [];
-
-				const fetchOnMessage = async (message: Imap.ImapMessage, seqNo: number) => {
-					const msg: Message = await getMessage(message);
-					msg.seqNo = seqNo;
-					messages.push(msg);
-
-					messagesRetrieved++;
-					if (messagesRetrieved === uidsToFetch.length) {
-						resolve(messages.filter((m) => !!m));
-					}
-				};
-
-				const fetchOnError = (error: Error) => {
-					fetch.removeListener('message', fetchOnMessage);
-					fetch.removeListener('end', fetchOnEnd);
-					reject(error);
-				};
-
-				const fetchOnEnd = () => {
-					fetch.removeListener('message', fetchOnMessage);
-					fetch.removeListener('error', fetchOnError);
-					// Suppress any errors emitted after fetch end to prevent uncaught
-					// exceptions from crashing the process. The fetch object may still
-					// emit errors (e.g. ECONNRESET) after 'end' if the connection drops
-					// while async message handlers are still in-flight.
-					fetch.on('error', () => {});
-				};
-
-				fetch.on('message', fetchOnMessage);
-				fetch.once('error', fetchOnError);
-				fetch.once('end', fetchOnEnd);
+		for await (const message of this.client.fetch(wanted, toFetchQuery(fetchOptions), {
+			uid: true,
+		})) {
+			messages.push({
+				attributes: {
+					uid: message.uid,
+					flags: [...(message.flags ?? [])],
+					date: message.internalDate ? new Date(message.internalDate) : undefined,
+					size: message.size,
+					struct: message.bodyStructure,
+				},
+				parts: toMessageBodyParts(message, fetchOptions),
 			});
-		});
+		}
+
+		// `fetch` yields nothing at all when the mailbox went away under it, which
+		// would otherwise read as "no new mail" and lose the batch silently.
+		if (messages.length === 0 && !this.client.usable) throw new ConnectionLostError();
+
+		return messages;
 	}
 
-	/** Download a "part" (either a portion of the message body, or an attachment) */
-	async getPartData(
-		/** The message returned from `search()` */
-		message: Message,
-		/** The message part to be downloaded, from the `message.attributes.struct` Array */
-		part: MessagePart,
-	) {
-		return await new Promise<PartData>((resolve, reject) => {
-			const fetch = this.imap.fetch(message.attributes.uid, {
-				bodies: [part.partID],
-				struct: true,
-			});
-
-			const fetchOnMessage = async (msg: ImapMessage) => {
-				const result = await getMessage(msg);
-				if (result.parts.length !== 1) {
-					reject(new Error('Got ' + result.parts.length + ' parts, should get 1'));
-					return;
-				}
-
-				const data = result.parts[0].body as string;
-				// Some providers (e.g. iCloud) omit a part's encoding; 7BIT is the IMAP
-				// default and leaves the body untransformed.
-				const encoding = (part.encoding || '7BIT').toUpperCase();
-				resolve(PartData.fromData(data, encoding));
-			};
-
-			const fetchOnError = (error: Error) => {
-				fetch.removeListener('message', fetchOnMessage);
-				fetch.removeListener('end', fetchOnEnd);
-				reject(error);
-			};
-
-			const fetchOnEnd = () => {
-				fetch.removeListener('message', fetchOnMessage);
-				fetch.removeListener('error', fetchOnError);
-				// Suppress any errors emitted after fetch end to prevent uncaught
-				// exceptions from crashing the process.
-				fetch.on('error', () => {});
-			};
-
-			fetch.once('message', fetchOnMessage);
-			fetch.once('error', fetchOnError);
-			fetch.once('end', fetchOnEnd);
+	async getPartData(message: Message, part: MessagePart): Promise<PartData> {
+		const downloaded = await this.client.download(String(message.attributes.uid), part.partID, {
+			uid: true,
+			chunkSize: DOWNLOAD_CHUNK_SIZE,
 		});
+
+		const content = this.assertRan(downloaded?.content, 'FETCH');
+
+		const chunks: Buffer[] = [];
+		for await (const chunk of content) {
+			chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string));
+		}
+
+		return new PartData(Buffer.concat(chunks));
 	}
 
-	/** Adds the provided flag(s) to the specified message(s). */
-	async addFlags(
-		/** The messages uid */
-		uid: number[],
-		/** The flags to add to the message(s). */
-		flags: string | string[],
-	) {
-		return await new Promise<void>((resolve, reject) => {
-			this.imap.addFlags(uid, flags, (e) => (e ? reject(e) : resolve()));
-		});
+	async addFlags(uids: number[], flags: string | string[]): Promise<void> {
+		if (uids.length === 0) return;
+
+		const applied = await this.client.messageFlagsAdd(
+			uids.join(','),
+			Array.isArray(flags) ? flags : [flags],
+			{ uid: true },
+		);
+
+		// A matching-nothing STORE still reports true, so `false` is always a refusal —
+		// a read-only mailbox, or one whose PERMANENTFLAGS omits the flag.
+		this.assertRan(applied || undefined, 'STORE');
 	}
 
-	/** Returns a list of mailboxes (folders). */
-	async getBoxes() {
-		return await new Promise<Imap.MailBoxes>((resolve, reject) => {
-			this.imap.getBoxes((e, boxes) => (e ? reject(e) : resolve(boxes)));
-		});
+	async getBoxes(): Promise<ListResponse[]> {
+		const boxes = await this.client.list();
+		if (boxes.length === 0 && !this.client.usable) throw new ConnectionLostError();
+		return boxes;
 	}
 
-	/** Open a mailbox */
-	async openBox(
-		/** The name of the box to open */
-		boxName: string,
-	): Promise<Imap.Box> {
-		return await new Promise((resolve, reject) => {
-			this.imap.openBox(boxName, (e, result) => (e ? reject(e) : resolve(result)));
-		});
+	async openBox(boxName: string): Promise<MailboxObject> {
+		const opened = await this.client.mailboxOpen(boxName);
+		const mailbox = this.assertRan(opened || undefined, 'SELECT');
+
+		if (mailbox.exists > 0) this.notifyMail(mailbox.exists);
+
+		return mailbox;
 	}
 
-	/** Close a mailbox */
-	async closeBox(
-		/** If autoExpunge is true, any messages marked as Deleted in the currently open mailbox will be removed @default true */
-		autoExpunge = true,
-	) {
-		return await new Promise<void>((resolve, reject) => {
-			this.imap.closeBox(autoExpunge, (e) => (e ? reject(e) : resolve()));
-		});
+	/** Disconnects. Returns immediately; the connection is gone shortly after. */
+	end(): void {
+		this.client.removeAllListeners();
+
+		this.client.once('close', () => this.emit('close'));
+		this.client.on('error', () => {});
+
+		const teardown = setTimeout(() => this.client.close(), LOGOUT_GRACE_PERIOD);
+		teardown.unref();
+
+		void this.client
+			.logout()
+			.catch(() => this.client.close())
+			.finally(() => clearTimeout(teardown));
 	}
 }

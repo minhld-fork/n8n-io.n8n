@@ -10,7 +10,6 @@ import type { Mock } from 'vitest';
 
 const mockConnection = Object.assign(new EventEmitter(), {
 	openBox: vi.fn().mockResolvedValue({}),
-	closeBox: vi.fn().mockResolvedValue(undefined),
 	end: vi.fn(),
 	search: vi.fn().mockResolvedValue([]),
 	getPartData: vi.fn(),
@@ -113,7 +112,7 @@ describe('ECONNRESET error handling', () => {
 		const emittedError = (triggerFunctions.emitError as Mock).mock
 			.calls[0][0] as NodeOperationError;
 		expect(emittedError).toBeInstanceOf(NodeOperationError);
-		expect(emittedError.description).toContain('Force Reconnect');
+		expect(emittedError.description).toContain('retry reactivating the workflow');
 	});
 
 	it('should call emitError only once when ECONNRESET is followed by close', async () => {

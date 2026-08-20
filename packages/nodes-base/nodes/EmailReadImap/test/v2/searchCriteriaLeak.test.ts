@@ -11,7 +11,6 @@ let capturedSearchCriteria: unknown[][] = [];
 
 const mockConnection = Object.assign(new EventEmitter(), {
 	openBox: vi.fn().mockResolvedValue({}),
-	closeBox: vi.fn().mockResolvedValue(undefined),
 	end: vi.fn(),
 	search: vi.fn().mockResolvedValue([]),
 	getPartData: vi.fn(),

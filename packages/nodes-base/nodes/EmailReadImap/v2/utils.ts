@@ -1,5 +1,6 @@
 import {
 	getParts,
+	type FetchOptions,
 	type ImapSimple,
 	type Message,
 	type MessagePart,
@@ -82,20 +83,12 @@ export async function getNewEmails(
 ) {
 	const format = this.getNodeParameter('format', 0) as string;
 
-	let fetchOptions = {};
+	let fetchOptions: FetchOptions = {};
 
 	if (format === 'simple' || format === 'raw') {
-		fetchOptions = {
-			bodies: ['TEXT', 'HEADER'],
-			markSeen: false,
-			struct: true,
-		};
+		fetchOptions = { bodies: ['TEXT', 'HEADER'], struct: true };
 	} else if (format === 'resolved') {
-		fetchOptions = {
-			bodies: [''],
-			markSeen: false,
-			struct: true,
-		};
+		fetchOptions = { bodies: [''], struct: true };
 	}
 
 	let results: Message[] = [];
@@ -182,7 +175,7 @@ export async function getNewEmails(
 				if (message.attributes.uid > maxUid) {
 					maxUid = message.attributes.uid;
 				}
-				const parts = getParts(message.attributes.struct as IDataObject[]);
+				const parts = getParts(message.attributes.struct);
 
 				newEmail = {
 					json: {
