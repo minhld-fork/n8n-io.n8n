@@ -3,6 +3,7 @@ import { z } from 'zod';
 
 import { createToolRegistry } from '../../tool-registry';
 import type { InstanceAiToolRegistry } from '../../types';
+import type { ReportTruncation } from '../sanitize-mcp-descriptions';
 import {
 	MCP_SCHEMA_DESCRIPTION_MAX_LENGTH,
 	MCP_TOOL_DESCRIPTION_MAX_LENGTH,
@@ -849,6 +850,72 @@ describe('sanitizeMcpToolSchemas', () => {
 			const schema = sanitizeInputSchema(z.object({ id: z.string().describe(description) }));
 
 			expect(schema.shape.id.description).toBe(description);
+		});
+
+		describe('truncation reports for merged discriminated-union descriptions', () => {
+			/** Every path a truncation was reported under, in call order. */
+			function reportedPaths(report: ReturnType<typeof vi.fn<ReportTruncation>>): string[] {
+				return report.mock.calls.map(([truncation]) => truncation.path);
+			}
+
+			it('should point a merged field description at the field, not at its union', () => {
+				const report = vi.fn<ReportTruncation>();
+				const tools = makeTools({
+					myTool: {
+						input: z.discriminatedUnion('action', [
+							z.object({
+								action: z.literal('create'),
+								body: z.string().describe('a'.repeat(100_000)),
+							}),
+							z.object({
+								action: z.literal('delete'),
+								body: z.string().describe('b'.repeat(100_000)),
+							}),
+						]),
+					},
+				});
+
+				sanitizeMcpToolSchemas(tools, { onDescriptionTruncated: report });
+
+				expect(reportedPaths(report)).toContain('$.inputSchema.body');
+				expect(reportedPaths(report)).not.toContain('$.inputSchema');
+			});
+
+			it('should point an action-hint description at the field it annotates', () => {
+				const report = vi.fn<ReportTruncation>();
+				const tools = makeTools({
+					myTool: {
+						input: z.discriminatedUnion('action', [
+							z.object({
+								action: z.literal('create'),
+								body: z.string().describe('a'.repeat(100_000)),
+							}),
+							z.object({ action: z.literal('delete') }),
+						]),
+					},
+				});
+
+				sanitizeMcpToolSchemas(tools, { onDescriptionTruncated: report });
+
+				expect(reportedPaths(report)).toContain('$.inputSchema.body');
+				expect(reportedPaths(report)).not.toContain('$.inputSchema');
+			});
+
+			it('should point a merged discriminator description at the discriminator', () => {
+				const report = vi.fn<ReportTruncation>();
+				const tools = makeTools({
+					myTool: {
+						input: z.discriminatedUnion('action', [
+							z.object({ action: z.literal('create').describe('a'.repeat(100_000)) }),
+							z.object({ action: z.literal('delete').describe('b'.repeat(100_000)) }),
+						]),
+					},
+				});
+
+				sanitizeMcpToolSchemas(tools, { onDescriptionTruncated: report });
+
+				expect(reportedPaths(report)).toEqual(['$.inputSchema.action']);
+			});
 		});
 	});
 });

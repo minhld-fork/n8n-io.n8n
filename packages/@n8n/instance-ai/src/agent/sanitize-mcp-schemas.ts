@@ -424,7 +424,8 @@ function buildMergedDiscriminatedField(
 	context: SanitizeContext,
 	sanitizeChild: SanitizeChild,
 ): z.ZodTypeAny {
-	const sanitizedField = sanitizeChild(entries[0].type, `${context.path}.${fieldName}`).optional();
+	const fieldPath = `${context.path}.${fieldName}`;
+	const sanitizedField = sanitizeChild(entries[0].type, fieldPath).optional();
 
 	if (context.strict && entries.length > 1) {
 		assertNoEnumConflict(fieldName, entries);
@@ -446,7 +447,7 @@ function buildMergedDiscriminatedField(
 		}
 		// Non-strict: combine with action context for external MCP tools
 		const combined = withDesc.map((d) => `For "${d.action}": ${d.description}`).join('. ');
-		return sanitizedField.describe(boundDescription(combined, context));
+		return sanitizedField.describe(boundDescription(combined, context, fieldPath));
 	}
 
 	if (entries.length < actionCount) {
@@ -456,7 +457,7 @@ function buildMergedDiscriminatedField(
 		const actionList = entries.map((e) => `"${e.action}"`).join(', ');
 		const baseDesc = withDesc[0]?.description;
 		const merged = baseDesc ? `For ${actionList}: ${baseDesc}` : `Only for ${actionList}`;
-		return sanitizedField.describe(boundDescription(merged, context));
+		return sanitizedField.describe(boundDescription(merged, context, fieldPath));
 	}
 
 	return sanitizedField;
@@ -507,7 +508,9 @@ function sanitizeDiscriminatedUnion(
 		);
 		mergedShape[discriminator] = z
 			.enum(enumValues as [string, ...string[]])
-			.describe(boundDescription(actionDescParts.join(' | '), context));
+			.describe(
+				boundDescription(actionDescParts.join(' | '), context, `${context.path}.${discriminator}`),
+			);
 	}
 
 	for (const [fieldName, entries] of fieldMeta) {
@@ -554,13 +557,18 @@ function sanitizeUnion(
 	return hadNull ? union.optional() : union;
 }
 
-/** Bound a description this module composes from MCP-supplied parts. */
-function boundDescription(description: string, context: SanitizeContext): string {
+/**
+ * Bound a description this module composes from MCP-supplied parts. `path` is
+ * the field the composed text lands on, not the union it was merged from — a
+ * report naming the parent leaves an operator with no way to tell which of the
+ * flattened fields was clipped.
+ */
+function boundDescription(description: string, context: SanitizeContext, path: string): string {
 	return context.strict
 		? description
 		: sanitizeMcpDescription(description, MCP_SCHEMA_DESCRIPTION_MAX_LENGTH, {
 				toolName: context.toolName,
-				path: context.path,
+				path,
 				report: context.reportTruncation,
 			});
 }
