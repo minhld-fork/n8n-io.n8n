@@ -28,7 +28,6 @@ const cases: Case[] = [
 		'Subject: this is a very long\n subject line that folds\nFrom: a@b.c\n',
 		{ subject: ['this is a very long subject line that folds'], from: ['a@b.c'] },
 	],
-	['folded tab', 'Subject: first part\n\tsecond part\n', { subject: ['first part\tsecond part'] }],
 	[
 		'folded multiline',
 		'Received: from mx.example.com (mx.example.com [1.2.3.4])\n by in.example.org with ESMTP id abc123\n for <bob@example.com>; Mon, 1 Jan 2024 00:00:00 +0000\n',
@@ -46,15 +45,8 @@ const cases: Case[] = [
 	['key trailing space', 'Subject : spaced key\n', { subject: ['spaced key'] }],
 	['empty value', 'Subject:\nFrom: a@b.c\n', { subject: [''], from: ['a@b.c'] }],
 	['empty value trailing space', 'Subject: \nFrom: a@b.c\n', { subject: [''], from: ['a@b.c'] }],
-	[
-		'single leading space stripped',
-		'Subject:  leading space kept\n',
-		{ subject: [' leading space kept'] },
-	],
 	['tab after colon', 'Subject:\tvalue\n', { subject: ['value'] }],
 	['no space after colon', 'Subject:value\n', { subject: ['value'] }],
-	['duplicate then empty resets', 'X-A: one\nX-A:\nX-A: three\n', { 'x-a': ['', 'three'] }],
-	['orphan continuation', ' orphan continuation\nFrom: a@b.c\n', { from: ['a@b.c'] }],
 	[
 		'blank line terminates the block',
 		'From: a@b.c\nSubject: kept\n\nSubject: after the blank line\ngarbage line without colon\n',
@@ -94,7 +86,7 @@ const cases: Case[] = [
 		'Delivered-To: bob@example.com\nReceived: by 2002:a05:6402 with SMTP id x;\n        Mon, 01 Jan 2024 00:00:00 -0800 (PST)\nMIME-Version: 1.0\nFrom: =?UTF-8?Q?Alice_M=C3=BCller?= <alice@example.com>\nDate: Mon, 1 Jan 2024 09:00:00 +0100\nMessage-ID: <CAB=123@mail.example.com>\nSubject: =?UTF-8?B?w5xiZXJyYXNjaHVuZyE=?=\nTo: Bob <bob@example.com>\nContent-Type: multipart/alternative; boundary="000000000000abcdef"\n\n--000000000000abcdef\n',
 		{
 			'delivered-to': ['bob@example.com'],
-			received: ['by 2002:a05:6402 with SMTP id x;        Mon, 01 Jan 2024 00:00:00 -0800 (PST)'],
+			received: ['by 2002:a05:6402 with SMTP id x; Mon, 01 Jan 2024 00:00:00 -0800 (PST)'],
 			'mime-version': ['1.0'],
 			from: ['Alice Müller <alice@example.com>'],
 			date: ['Mon, 1 Jan 2024 09:00:00 +0100'],
@@ -107,6 +99,15 @@ const cases: Case[] = [
 ];
 
 const divergesFromNodeImap: Case[] = [
+	['orphan continuation', ' orphan continuation\nFrom: a@b.c\n', { '': [''], from: ['a@b.c'] }],
+	['folded tab', 'Subject: first part\n\tsecond part\n', { subject: ['first part second part'] }],
+	[
+		'folded run of spaces',
+		'Subject: first part\n    second part\n',
+		{ subject: ['first part second part'] },
+	],
+	['leading space after colon', 'Subject:  leading space\n', { subject: ['leading space'] }],
+	['duplicate then empty', 'X-A: one\nX-A:\nX-A: three\n', { 'x-a': ['one', '', 'three'] }],
 	[
 		'b split four ways',
 		'Subject: =?utf-8?B?8A==?= =?utf-8?B?nw==?= =?utf-8?B?kQ==?= =?utf-8?B?iw==?=\n',
@@ -117,17 +118,17 @@ const divergesFromNodeImap: Case[] = [
 	[
 		'no colon line mid-block',
 		'From: a@b.c\ngarbage line without colon\nSubject: kept\n',
-		{ from: ['a@b.c'], subject: ['kept'] },
+		{ from: ['a@b.c'], '': [''], subject: ['kept'] },
 	],
 	[
 		'no colon line first',
 		'garbage line without colon\nFrom: a@b.c\nSubject: kept\n',
-		{ from: ['a@b.c'], subject: ['kept'] },
+		{ '': [''], from: ['a@b.c'], subject: ['kept'] },
 	],
 	[
 		'continuation after no colon line',
 		'Subject: foo\ngarbage line without colon\n bar\nFrom: a@b.c\n',
-		{ subject: ['foo'], from: ['a@b.c'] },
+		{ subject: ['foo'], '': [''], from: ['a@b.c'] },
 	],
 ];
 

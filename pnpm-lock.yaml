@@ -2594,8 +2594,8 @@ importers:
         specifier: 1.7.1
         version: 1.7.1
       libmime:
-        specifier: 5.3.7
-        version: 5.3.7
+        specifier: 5.4.2
+        version: 5.4.2
     devDependencies:
       '@n8n/typescript-config':
         specifier: workspace:*

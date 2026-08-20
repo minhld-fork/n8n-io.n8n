@@ -24,7 +24,7 @@
   ],
   "dependencies": {
     "imapflow": "1.7.1",
-    "libmime": "5.3.7"
+    "libmime": "5.4.2"
   },
   "devDependencies": {
     "@n8n/typescript-config": "workspace:*",
