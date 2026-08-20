@@ -252,7 +252,15 @@ export class RoleMappingRuleService {
 		return this.toResponse(loaded);
 	}
 
-	async delete(id: string): Promise<{ ruleType: 'instance' | 'project' }> {
+	async delete({
+		id,
+		userId,
+		userEmail,
+	}: {
+		id: string;
+		userId: string;
+		userEmail?: string;
+	}): Promise<{ ruleType: 'instance' | 'project' }> {
 		if (typeof id !== 'string' || id.length === 0) {
 			throw new BadRequestError('Rule id is required');
 		}
@@ -266,6 +274,13 @@ export class RoleMappingRuleService {
 		const ruleType = rule.type as 'instance' | 'project';
 		await this.roleMappingRuleRepository.remove(rule);
 		await this.normalizeOrderForType(ruleType);
+
+		this.eventService.emit('role-mapping-rule-deleted', {
+			user: { id: userId, email: userEmail },
+			ruleId: id,
+			ruleType,
+		});
+
 		return { ruleType };
 	}
 

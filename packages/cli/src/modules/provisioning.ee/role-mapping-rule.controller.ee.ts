@@ -119,12 +119,10 @@ export class RoleMappingRuleController {
 			return res.status(403).json({ message: 'Provisioning is not licensed' });
 		}
 
-		const { ruleType } = await this.roleMappingRuleService.delete(id);
-
-		this.eventService.emit('role-mapping-rule-deleted', {
-			user: { id: req.user.id, email: req.user.email },
-			ruleId: id,
-			ruleType,
+		await this.roleMappingRuleService.delete({
+			id,
+			userId: req.user.id,
+			userEmail: req.user.email,
 		});
 
 		return { success: true };
