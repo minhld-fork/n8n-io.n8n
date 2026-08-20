@@ -32,11 +32,20 @@ export const MCP_SCHEMA_MAX_DEPTH = 32;
 export const MCP_SCHEMA_MAX_NODES = 1_000;
 export const MCP_SCHEMA_MAX_OBJECT_PROPERTIES = 250;
 export const MCP_SCHEMA_MAX_UNION_OPTIONS = 100;
+/**
+ * Whole-schema byte cap, the backstop for the free text the description caps do
+ * not cover — enum values, defaults, consts, property names. Those are data the
+ * model has to echo back verbatim, so they are rejected rather than rewritten:
+ * a clipped enum value would just produce failing tool calls. 64 KB is ~3x the
+ * largest single tool schema on mcp.notion.com (21,815 chars, 2026-08-20).
+ */
+export const MCP_SCHEMA_MAX_SERIALIZED_LENGTH = 65_536;
 
 type McpSchemaLimitType =
 	| 'depth'
 	| 'nodes'
 	| 'objectProperties'
+	| 'serializedLength'
 	| 'unionOptions'
 	| 'unsupportedType';
 
@@ -88,6 +97,7 @@ interface SanitizeZodTypeOptions {
 }
 
 interface ValidateJsonSchemaOptions {
+	maxSerializedLength?: number;
 	maxDepth?: number;
 	maxNodes?: number;
 	maxObjectProperties?: number;
@@ -201,11 +211,41 @@ function validateJsonSchemaNode(
 	}
 }
 
+/**
+ * Serialized size of a schema, or undefined when it cannot be measured (a
+ * cyclic schema throws here, and the node-count walk rejects it anyway).
+ */
+function serializedLength(schema: unknown): number | undefined {
+	try {
+		return JSON.stringify(schema)?.length;
+	} catch {
+		return undefined;
+	}
+}
+
 export function assertMcpJsonSchemaWithinLimits(
 	schema: unknown,
 	options: ValidateJsonSchemaOptions = {},
 ): void {
-	validateJsonSchemaNode(schema, options.path ?? '$.inputSchema', 0, {
+	const path = options.path ?? '$.inputSchema';
+	const maxSerializedLength = options.maxSerializedLength ?? MCP_SCHEMA_MAX_SERIALIZED_LENGTH;
+	const length = serializedLength(schema);
+	if (length !== undefined && length > maxSerializedLength) {
+		throw new McpSchemaSanitizationError(
+			`MCP schema exceeds maximum serialized length of ${maxSerializedLength}`,
+			{
+				toolName: options.toolName,
+				path,
+				depth: 0,
+				maxDepth: options.maxDepth ?? MCP_SCHEMA_MAX_DEPTH,
+				limit: maxSerializedLength,
+				limitType: 'serializedLength',
+				count: length,
+			},
+		);
+	}
+
+	validateJsonSchemaNode(schema, path, 0, {
 		toolName: options.toolName,
 		maxDepth: options.maxDepth ?? MCP_SCHEMA_MAX_DEPTH,
 		maxNodes: options.maxNodes ?? MCP_SCHEMA_MAX_NODES,
@@ -776,6 +816,7 @@ export function sanitizeMcpToolSchemas(
 		maxNodes?: number;
 		maxObjectProperties?: number;
 		maxUnionOptions?: number;
+		maxSerializedLength?: number;
 		onError?: (error: McpSchemaSanitizationError) => void;
 		onDescriptionTruncated?: ReportTruncation;
 	} = {},
@@ -806,6 +847,7 @@ export function sanitizeMcpToolSchemas(
 						maxNodes: options.maxNodes,
 						maxObjectProperties: options.maxObjectProperties,
 						maxUnionOptions: options.maxUnionOptions,
+						maxSerializedLength: options.maxSerializedLength,
 						toolName: name,
 					});
 					inputSchema = sanitizeMcpJsonSchemaDescriptions(inputSchema, {
@@ -833,6 +875,7 @@ export function sanitizeMcpToolSchemas(
 						maxNodes: options.maxNodes,
 						maxObjectProperties: options.maxObjectProperties,
 						maxUnionOptions: options.maxUnionOptions,
+						maxSerializedLength: options.maxSerializedLength,
 						toolName: name,
 						path: '$.outputSchema',
 					});

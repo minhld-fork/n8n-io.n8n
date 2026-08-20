@@ -73,7 +73,12 @@ export function sanitizeMcpDescription(
 		originalLength: stripped.length,
 		limit: maxLength,
 	});
-	return stripped.slice(0, maxLength - TRUNCATION_MARKER.length).trimEnd() + TRUNCATION_MARKER;
+	// Drop a trailing high surrogate: slicing cuts UTF-16 code units, so a cap
+	// landing mid-emoji would otherwise leave half a character behind.
+	const clipped = stripped
+		.slice(0, maxLength - TRUNCATION_MARKER.length)
+		.replace(/[\uD800-\uDBFF]$/, '');
+	return clipped.trimEnd() + TRUNCATION_MARKER;
 }
 
 /**

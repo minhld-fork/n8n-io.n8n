@@ -75,6 +75,18 @@ describe('sanitizeMcpDescription', () => {
 		expect(report).not.toHaveBeenCalled();
 	});
 
+	it('should not leave half an emoji at the truncation boundary', () => {
+		const cap = 100;
+		const marker = '… [truncated]'.length;
+		// Emoji straddles the cut: slicing UTF-16 code units would split the pair.
+		const description = 'a'.repeat(cap - marker - 1) + '😀' + 'b'.repeat(50);
+
+		const result = sanitizeMcpDescription(description, cap);
+
+		expect(/[\uD800-\uDFFF]/.test(result)).toBe(false);
+		expect(result.endsWith('… [truncated]')).toBe(true);
+	});
+
 	it('should cap the length and mark the description as truncated', () => {
 		const flood = 'a'.repeat(5_000);
 
