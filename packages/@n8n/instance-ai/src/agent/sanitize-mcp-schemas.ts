@@ -9,12 +9,23 @@
  * non-null alternatives. For example:
  *   z.union([z.string(), z.null()])  →  z.string().optional()
  *   z.nullable(z.string())           →  z.string().optional()
+ *
+ * The same walk bounds and strips the server-supplied description text it
+ * carries (see `sanitize-mcp-descriptions.ts`), which otherwise reaches the
+ * model verbatim.
  */
 
 import type { BuiltTool } from '@n8n/agents';
 import { isRecord } from '@n8n/utils/is-record';
 import { z } from 'zod';
 
+import type { ReportTruncation } from './sanitize-mcp-descriptions';
+import {
+	MCP_SCHEMA_DESCRIPTION_MAX_LENGTH,
+	MCP_TOOL_DESCRIPTION_MAX_LENGTH,
+	sanitizeMcpDescription,
+	sanitizeMcpJsonSchemaDescriptions,
+} from './sanitize-mcp-descriptions';
 import type { InstanceAiToolRegistry } from '../types';
 
 export const MCP_SCHEMA_MAX_DEPTH = 32;
@@ -54,6 +65,7 @@ interface SanitizeBudget {
 
 interface SanitizeContext {
 	strict: boolean;
+	reportTruncation?: ReportTruncation;
 	toolName?: string;
 	path: string;
 	depth: number;
@@ -65,6 +77,7 @@ interface SanitizeContext {
 }
 
 interface SanitizeZodTypeOptions {
+	reportTruncation?: ReportTruncation;
 	maxDepth?: number;
 	maxNodes?: number;
 	maxObjectProperties?: number;
@@ -217,6 +230,7 @@ export function sanitizeZodType(
 ): z.ZodTypeAny {
 	return sanitizeZodTypeInner(schema, {
 		strict,
+		reportTruncation: options.reportTruncation,
 		toolName: options.toolName,
 		path: options.path ?? '$',
 		depth: 0,
@@ -392,7 +406,7 @@ function buildMergedDiscriminatedField(
 		}
 		// Non-strict: combine with action context for external MCP tools
 		const combined = withDesc.map((d) => `For "${d.action}": ${d.description}`).join('. ');
-		return sanitizedField.describe(combined);
+		return sanitizedField.describe(boundDescription(combined, context));
 	}
 
 	if (entries.length < actionCount) {
@@ -402,7 +416,7 @@ function buildMergedDiscriminatedField(
 		const actionList = entries.map((e) => `"${e.action}"`).join(', ');
 		const baseDesc = withDesc[0]?.description;
 		const merged = baseDesc ? `For ${actionList}: ${baseDesc}` : `Only for ${actionList}`;
-		return sanitizedField.describe(merged);
+		return sanitizedField.describe(boundDescription(merged, context));
 	}
 
 	return sanitizedField;
@@ -453,7 +467,7 @@ function sanitizeDiscriminatedUnion(
 		);
 		mergedShape[discriminator] = z
 			.enum(enumValues as [string, ...string[]])
-			.describe(actionDescParts.join(' | '));
+			.describe(boundDescription(actionDescParts.join(' | '), context));
 	}
 
 	for (const [fieldName, entries] of fieldMeta) {
@@ -500,7 +514,49 @@ function sanitizeUnion(
 	return hadNull ? union.optional() : union;
 }
 
+/** Bound a description this module composes from MCP-supplied parts. */
+function boundDescription(description: string, context: SanitizeContext): string {
+	return context.strict
+		? description
+		: sanitizeMcpDescription(description, MCP_SCHEMA_DESCRIPTION_MAX_LENGTH, {
+				toolName: context.toolName,
+				path: context.path,
+				report: context.reportTruncation,
+			});
+}
+
+/**
+ * Carry the source node's description onto its sanitized replacement, bounded
+ * and stripped. Only for non-strict (MCP-sourced) schemas: strict mode is our
+ * own tool schemas, whose descriptions are trusted and can legitimately be
+ * longer than the MCP cap.
+ */
+function withSanitizedDescription(
+	source: z.ZodTypeAny,
+	sanitized: z.ZodTypeAny,
+	context: SanitizeContext,
+): z.ZodTypeAny {
+	if (context.strict) return sanitized;
+
+	const description = source.description;
+	if (description === undefined) return sanitized;
+
+	const safeDescription = sanitizeMcpDescription(description, MCP_SCHEMA_DESCRIPTION_MAX_LENGTH, {
+		toolName: context.toolName,
+		path: context.path,
+		report: context.reportTruncation,
+	});
+	if (safeDescription === sanitized.description) return sanitized;
+	// Leaf types pass through untouched, so an empty result has to be written
+	// back — otherwise the invisible-only original survives on the schema.
+	return sanitized.describe(safeDescription);
+}
+
 function sanitizeZodTypeInner(schema: z.ZodTypeAny, context: SanitizeContext): z.ZodTypeAny {
+	return withSanitizedDescription(schema, sanitizeZodTypeNode(schema, context), context);
+}
+
+function sanitizeZodTypeNode(schema: z.ZodTypeAny, context: SanitizeContext): z.ZodTypeAny {
 	if (context.depth > context.maxDepth) {
 		throw createLimitError(
 			context,
@@ -709,6 +765,9 @@ export function sanitizeInputSchema<T extends z.ZodTypeAny>(schema: T): T {
  * unlikely to be hit. If it is, conflicting descriptions are merged with
  * action context (e.g. 'For "create": ... For "delete": ...') rather than
  * throwing.
+ *
+ * Also bounds and strips every description the server supplies — the tool's
+ * own and the ones on its schema fields.
  */
 export function sanitizeMcpToolSchemas(
 	tools: InstanceAiToolRegistry,
@@ -718,8 +777,10 @@ export function sanitizeMcpToolSchemas(
 		maxObjectProperties?: number;
 		maxUnionOptions?: number;
 		onError?: (error: McpSchemaSanitizationError) => void;
+		onDescriptionTruncated?: ReportTruncation;
 	} = {},
 ): InstanceAiToolRegistry {
+	const reportTruncation = options.onDescriptionTruncated;
 	for (const [name, tool] of tools) {
 		let inputSchema: BuiltTool['inputSchema'] = tool.inputSchema;
 		let outputSchema: BuiltTool['outputSchema'] = tool.outputSchema;
@@ -729,6 +790,7 @@ export function sanitizeMcpToolSchemas(
 				if (inputSchema instanceof z.ZodType) {
 					inputSchema = ensureTopLevelObject(
 						sanitizeZodType(inputSchema, false, {
+							reportTruncation,
 							maxDepth: options.maxDepth,
 							maxNodes: options.maxNodes,
 							maxObjectProperties: options.maxObjectProperties,
@@ -746,11 +808,17 @@ export function sanitizeMcpToolSchemas(
 						maxUnionOptions: options.maxUnionOptions,
 						toolName: name,
 					});
+					inputSchema = sanitizeMcpJsonSchemaDescriptions(inputSchema, {
+						toolName: name,
+						path: '$.inputSchema',
+						report: reportTruncation,
+					});
 				}
 			}
 			if (outputSchema) {
 				if (outputSchema instanceof z.ZodType) {
 					outputSchema = sanitizeZodType(outputSchema, false, {
+						reportTruncation,
 						maxDepth: options.maxDepth,
 						maxNodes: options.maxNodes,
 						maxObjectProperties: options.maxObjectProperties,
@@ -768,6 +836,11 @@ export function sanitizeMcpToolSchemas(
 						toolName: name,
 						path: '$.outputSchema',
 					});
+					outputSchema = sanitizeMcpJsonSchemaDescriptions(outputSchema, {
+						toolName: name,
+						path: '$.outputSchema',
+						report: reportTruncation,
+					});
 				}
 			}
 		} catch (error) {
@@ -781,6 +854,11 @@ export function sanitizeMcpToolSchemas(
 
 		tools.set(name, {
 			...tool,
+			description: sanitizeMcpDescription(tool.description, MCP_TOOL_DESCRIPTION_MAX_LENGTH, {
+				toolName: name,
+				path: '$.description',
+				report: reportTruncation,
+			}),
 			...(inputSchema ? { inputSchema } : {}),
 			...(outputSchema ? { outputSchema } : {}),
 		});
