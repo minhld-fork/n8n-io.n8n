@@ -1,6 +1,6 @@
 import { UnimplementedError } from '../common';
 import { GraphValidationError } from './graph-validation.error';
-import type { GraphEdge, WorkflowGraph } from './workflow-graph';
+import { isBatchStepConfig, type GraphEdge, type WorkflowGraph } from './workflow-graph';
 
 /** A loop, derived from the graph's marked back-edges. */
 export interface WorkflowLoop {
@@ -152,6 +152,9 @@ export function validateLoops(graph: WorkflowGraph): void {
 	const batchNodeIds = new Set(
 		graph.nodes.filter((node) => node.type === 'batch').map((node) => node.id),
 	);
+	const triggerNodeIds = new Set(
+		graph.nodes.filter((node) => node.type === 'trigger').map((node) => node.id),
+	);
 	const loops = deriveLoops(graph);
 	const loopsByBatchNode = new Map(loops.map((loop) => [loop.batchNodeId, loop]));
 
@@ -174,6 +177,27 @@ export function validateLoops(graph: WorkflowGraph): void {
 			throw new GraphValidationError(
 				`Node ${name(batchNodeId)} has a back-edge returning to it but is not a batch node`,
 			);
+		}
+
+		// The engine runs a batch node itself, so a config it cannot read is a
+		// graph it cannot execute. Caught here rather than mid-execution, where it
+		// would fail a step that had already claimed its work.
+		const batchNode = graph.nodes.find((node) => node.id === batchNodeId);
+		if (!isBatchStepConfig(batchNode?.config)) {
+			throw new GraphValidationError(
+				`Batch node ${name(batchNodeId)} has no batch size, and it must be a whole number of at least 1`,
+			);
+		}
+
+		// A trigger inside a loop has nothing outside pointing in, so the loop opens
+		// at iteration 1 with no iteration 0, and its ledger never closes. A loop
+		// nothing points into is legal only where the trigger cannot reach it.
+		for (const memberId of memberIds) {
+			if (triggerNodeIds.has(memberId)) {
+				throw new GraphValidationError(
+					`Trigger ${name(memberId)} is inside the loop of ${name(batchNodeId)}, so that loop could never start`,
+				);
+			}
 		}
 
 		// Nesting, before the shape rules: two looping batch nodes land in one

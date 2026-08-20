@@ -270,6 +270,13 @@ export class TypeOrmStepStore implements StepStore {
 		return Object.fromEntries(rows.map((row) => [row.nodeId, row]));
 	}
 
+	async loadAllSteps(executionId: string): Promise<StepRecord[]> {
+		return await this.repo.find({
+			where: { executionId },
+			order: { nodeId: 'ASC', iteration: 'ASC' },
+		});
+	}
+
 	async countSettledSteps(executionId: string): Promise<number> {
 		return await this.repo.count({
 			where: { executionId, status: In([...SETTLED_STEP_STATUSES]) },

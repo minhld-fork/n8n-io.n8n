@@ -3,8 +3,9 @@ import { isSettledStatus, type StepStatus } from './execution.types';
 import { classifyEdge } from './iteration-mapping';
 import type { StepStore, StepSummary } from './step-store';
 
-/** A batch node's output slots: 0 is done, 1 is loop. */
-const LOOP_SLOT = 1;
+/** A batch node's output slots. */
+export const DONE_SLOT = 0;
+export const LOOP_SLOT = 1;
 
 /**
  * A loop's batch node steps form a ledger: one per iteration, written strictly

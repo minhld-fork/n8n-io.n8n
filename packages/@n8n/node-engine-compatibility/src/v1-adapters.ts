@@ -3,6 +3,7 @@
  * back into engine v1 artifacts (`INode`, `Workflow`, run data, node execute context).
  */
 
+import { deriveLoops, isBatchStepConfig } from '@n8n/engine';
 import type { GraphNode, StepSlots, WorkflowGraph } from '@n8n/engine';
 import { ExecuteContext, UnrecognizedNodeTypeError } from 'n8n-core';
 import type {
@@ -18,19 +19,26 @@ import type {
 } from 'n8n-workflow';
 import { createRunExecutionData, Workflow } from 'n8n-workflow';
 
-import { MAIN_CONNECTION_TYPE, MANUAL_TRIGGER_TYPE } from './constants';
+import {
+	MAIN_CONNECTION_TYPE,
+	MANUAL_TRIGGER_TYPE,
+	SPLIT_IN_BATCHES_TYPE,
+	SPLIT_IN_BATCHES_TYPE_VERSION,
+} from './constants';
 import { isV1NodeStepConfig } from './guards';
 import { fromStepInputs } from './io';
 import type { CreateExecuteContextParams, V1Execution, V1NodeStepConfig } from './types';
 
 export function toV1Execution(
 	graph: WorkflowGraph,
-	outputsByNodeId: Record<string, StepSlots>,
+	outputsByNode: Record<string, Record<number, StepSlots>>,
+	activeNodeId: string,
+	activeIteration: number,
 ): V1Execution {
 	return {
 		nodes: toV1Nodes(graph),
 		connections: toV1Connections(graph),
-		runData: toV1RunData(graph, outputsByNodeId),
+		runData: toV1RunData(graph, outputsByNode, activeNodeId, activeIteration),
 	};
 }
 
@@ -47,6 +55,10 @@ function toV1Nodes(graph: WorkflowGraph): INode[] {
 					parameters: {},
 				},
 			];
+		}
+
+		if (graphNode.type === 'batch') {
+			return [toV1BatchNode(graphNode)];
 		}
 
 		if (!isV1NodeStepConfig(graphNode.config)) return [];
@@ -79,24 +91,64 @@ function toV1Connections(graph: WorkflowGraph): IConnections {
 	return connections;
 }
 
-function toV1RunData(graph: WorkflowGraph, outputsByNodeId: Record<string, StepSlots>): IRunData {
+/**
+ * v1 run data is a list per node, indexed by run index, and an iteration is a run
+ * index. `$('X')` takes X's last run, so which runs a node shows decides what an
+ * expression reads. That depends on where the active node sits.
+ *
+ * From outside every loop, each node shows all its runs, as v1 does. So a node
+ * after a loop reading `$('Loop')` gets the loop's final pass.
+ *
+ * From inside a loop, a node in that same loop shows runs through the active
+ * pass, so `$('X')` reads the pass the active node is on. Padding to the active
+ * pass matters: without it, a member skipped on this pass would show its previous
+ * one instead. Any other node shows iteration 0 alone, since its later passes
+ * belong to a loop the active node is not in and must not be selected.
+ *
+ * A node that never ran shows nothing, so naming it still fails as "hasn't been
+ * executed".
+ */
+function toV1RunData(
+	graph: WorkflowGraph,
+	outputsByNode: Record<string, Record<number, StepSlots>>,
+	activeNodeId: string,
+	activeIteration: number,
+): IRunData {
 	const namesById = new Map(graph.nodes.map((node) => [node.id, node.name]));
 	const sourcesByNodeId = toV1Sources(graph);
+	const activeLoop = deriveLoops(graph).find((loop) => loop.memberIds.has(activeNodeId));
 
 	const runData: IRunData = {};
-	for (const [completedNodeId, outputs] of Object.entries(outputsByNodeId)) {
+	for (const [completedNodeId, outputsByIteration] of Object.entries(outputsByNode)) {
 		const nodeName = namesById.get(completedNodeId);
 		if (nodeName === undefined) continue;
 
-		runData[nodeName] = [
-			{
-				startTime: 0,
-				executionTime: 0,
-				executionIndex: 0,
-				source: sourcesByNodeId.get(completedNodeId) ?? [],
-				data: { [MAIN_CONNECTION_TYPE]: fromStepInputs(outputs) },
+		const iterations = Object.keys(outputsByIteration).map(Number);
+		if (iterations.length === 0) continue;
+
+		let lastShown: number;
+		if (!activeLoop) {
+			lastShown = Math.max(...iterations);
+		} else if (activeLoop.memberIds.has(completedNodeId)) {
+			lastShown = activeIteration;
+		} else {
+			lastShown = 0;
+		}
+
+		const source = sourcesByNodeId.get(completedNodeId) ?? [];
+
+		// Dense, since v1 dereferences whatever entry it finds and a hole reads as
+		// undefined. A pass the node was skipped on shows as a run with no data,
+		// which is what happened.
+		runData[nodeName] = Array.from({ length: lastShown + 1 }, (_, iteration) => ({
+			startTime: 0,
+			executionTime: 0,
+			executionIndex: iteration,
+			source,
+			data: {
+				[MAIN_CONNECTION_TYPE]: fromStepInputs(outputsByIteration[iteration] ?? []),
 			},
-		];
+		}));
 	}
 
 	return runData;
@@ -135,6 +187,27 @@ export function toV1Workflow(
 		active: false,
 		nodeTypes: tolerantNodeTypes(nodeTypes),
 	});
+}
+
+/**
+ * A stand-in for a batch node, so expressions can name it.
+ *
+ * The engine runs a batch node itself, so its config carries only the batch
+ * size, not the v1 node identity. The v1 workflow still needs the node present:
+ * `$('Loop')` has to resolve, and the connections refer to it. Nothing runs this
+ * node through v1, so the type and version only have to name what it is.
+ */
+function toV1BatchNode(graphNode: GraphNode): INode {
+	const batchSize = isBatchStepConfig(graphNode.config) ? graphNode.config.batchSize : undefined;
+
+	return {
+		id: graphNode.id,
+		name: graphNode.name,
+		type: SPLIT_IN_BATCHES_TYPE,
+		typeVersion: SPLIT_IN_BATCHES_TYPE_VERSION,
+		position: [0, 0],
+		parameters: batchSize === undefined ? {} : { batchSize },
+	};
 }
 
 export function toV1Node(graphNode: GraphNode, config: V1NodeStepConfig): INode {
@@ -212,7 +285,9 @@ export function toV1ExecuteContext({
 		additionalData,
 		mode,
 		runExecutionData,
-		0,
+		// v1 counts a node's runs with the run index, which is what an iteration is,
+		// so `$runIndex` reports the pass and `$('X')` resolves the right one.
+		stepContext.iteration,
 		connectionInputData,
 		inputData,
 		executeData,

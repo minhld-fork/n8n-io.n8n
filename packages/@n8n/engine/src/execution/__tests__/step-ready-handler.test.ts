@@ -78,6 +78,7 @@ function makeStepStore(step: Partial<StepRecord> = {}, overrides: Partial<StepSt
 			.mockResolvedValue({ [at('trigger')]: stepRow('trigger', 'completed', [{}]) }),
 		loadStepSummariesByKeys: vi.fn().mockResolvedValue({}),
 		loadLatestStepSummaries: vi.fn().mockResolvedValue({}),
+		loadAllSteps: vi.fn().mockResolvedValue([]),
 		countSettledSteps: vi.fn().mockResolvedValue(0),
 		hasFailedSteps: vi.fn().mockResolvedValue(false),
 		...overrides,
@@ -128,6 +129,7 @@ describe('StepReadyHandler', () => {
 				stepId: 'step-a',
 				workflowId: 'wf-1',
 				mode: 'production',
+				iteration: 0,
 			},
 		});
 		expect(stepStore.completeStep).toHaveBeenCalledWith('step-a', [[{ json: { ok: true } }]]);

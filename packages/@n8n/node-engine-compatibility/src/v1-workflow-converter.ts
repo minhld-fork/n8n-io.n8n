@@ -1,11 +1,14 @@
-import type { GraphEdge, GraphNode, WorkflowGraph } from '@n8n/engine';
+import { isBatchStepConfig } from '@n8n/engine';
+import type { BatchStepConfig, GraphEdge, GraphNode, WorkflowGraph } from '@n8n/engine';
 import type { INode, INodeConnections, IWorkflowBase } from 'n8n-workflow';
 
 import {
+	DEFAULT_BATCH_SIZE,
 	MAIN_CONNECTION_TYPE,
 	MANUAL_TRIGGER_TYPE,
 	MERGE_TYPE,
 	SPLIT_IN_BATCHES_TYPE,
+	SPLIT_IN_BATCHES_TYPE_VERSION,
 } from './constants';
 import {
 	UnsupportedConnectionTypeError,
@@ -14,6 +17,7 @@ import {
 	UnsupportedTriggerError,
 	UnsupportedWorkflowError,
 } from './errors';
+import { isRecord } from './guards';
 import type { V1NodeStepConfig } from './types';
 
 /**
@@ -88,6 +92,10 @@ export class V1WorkflowConverter {
 
 		if (node.type === MERGE_TYPE) this.assertSupportedMergeMode(node);
 
+		if (node.type === SPLIT_IN_BATCHES_TYPE) {
+			return { id: node.id, name: node.name, type: 'batch', config: toBatchConfig(node) };
+		}
+
 		const config: V1NodeStepConfig = {
 			nodeType: node.type,
 			typeVersion: node.typeVersion,
@@ -95,9 +103,7 @@ export class V1WorkflowConverter {
 			continueOnFail: node.continueOnFail === true || node.onError === 'continueRegularOutput',
 		};
 
-		const type = node.type === SPLIT_IN_BATCHES_TYPE ? 'batch' : 'v1-node';
-
-		return { id: node.id, name: node.name, type, config };
+		return { id: node.id, name: node.name, type: 'v1-node', config };
 	}
 
 	/**
@@ -360,4 +366,53 @@ export class V1WorkflowConverter {
 
 		return sccs;
 	}
+}
+
+/**
+ * A batch node's size, read at conversion time.
+ *
+ * The engine runs a batch node itself, so it needs the size as a number rather
+ * than as a parameter to resolve on every pass. Conversion happens once, before
+ * any data exists, so an expression cannot be resolved here. A size below 1 would
+ * let a pass take no items and loop forever. The converter refuses both rather
+ * than guess.
+ */
+function toBatchConfig(node: INode): BatchStepConfig {
+	// v2 numbers its outputs the other way round, loop first and done second, and
+	// defaults the size to 10. Converting it against v3's order would send the
+	// body's items to the wrong place, so it is refused rather than guessed at.
+	if (node.typeVersion !== SPLIT_IN_BATCHES_TYPE_VERSION) {
+		throw new UnsupportedWorkflowError(
+			`Node "${node.name}" is a Split In Batches of version ${node.typeVersion}, and only version ${SPLIT_IN_BATCHES_TYPE_VERSION} is supported.`,
+		);
+	}
+
+	// The engine's batch step takes each pass off a list fixed at the first pass,
+	// so it has no way to restart a loop mid-flight. Accepting the option and
+	// ignoring it would change what the workflow does, silently.
+	const options: unknown = node.parameters?.options;
+	const reset = isRecord(options) ? options.reset : undefined;
+	if (reset !== undefined && reset !== false) {
+		throw new UnsupportedWorkflowError(
+			`Node "${node.name}" uses the reset option, which is not supported yet.`,
+		);
+	}
+
+	const batchSize: unknown = node.parameters?.batchSize ?? DEFAULT_BATCH_SIZE;
+
+	if (typeof batchSize === 'string') {
+		throw new UnsupportedWorkflowError(
+			`Node "${node.name}" sets its batch size from an expression, which is not supported yet.`,
+		);
+	}
+
+	const config = { batchSize };
+
+	if (!isBatchStepConfig(config)) {
+		throw new UnsupportedWorkflowError(
+			`Node "${node.name}" has a batch size of ${String(batchSize)}, and it must be a whole number of at least 1.`,
+		);
+	}
+
+	return config;
 }
