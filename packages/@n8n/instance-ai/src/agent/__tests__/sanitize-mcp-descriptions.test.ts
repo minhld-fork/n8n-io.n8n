@@ -95,6 +95,45 @@ describe('sanitizeMcpDescription', () => {
 		expect(result).toHaveLength(100);
 		expect(result.endsWith('… [truncated]')).toBe(true);
 	});
+
+	it('should report the length the server sent, not the length left after stripping', () => {
+		const report = vi.fn();
+		const padded = '\u200B'.repeat(2_000) + 'a'.repeat(500);
+
+		sanitizeMcpDescription(padded, 100, { path: '$.description', report });
+
+		expect(report).toHaveBeenCalledWith(
+			expect.objectContaining({ originalLength: 2_500, limit: 100 }),
+		);
+	});
+
+	it('should not walk more than the scan window of a megabyte-sized description', () => {
+		// Every strip pass costs time linear in what it is handed, so the input is
+		// bounded before they run rather than after.
+		const flood = '<!--'.repeat(500_000);
+
+		const started = process.hrtime.bigint();
+		const result = sanitizeMcpDescription(flood, 4_096);
+		const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+
+		expect(result.endsWith('… [truncated]')).toBe(true);
+		expect(result.length).toBeLessThanOrEqual(4_096);
+		expect(elapsedMs).toBeLessThan(1_000);
+	});
+
+	it('should mark a description as truncated when only its scanned window survived', () => {
+		const report = vi.fn();
+		// Comments fill the whole scan window, so what is left fits the cap even
+		// though text past the window was dropped.
+		const buried = '<!--x-->'.repeat(2_000) + 'Read a page.';
+
+		const result = sanitizeMcpDescription(buried, 100, { path: '$.description', report });
+
+		expect(result).toBe('… [truncated]');
+		expect(report).toHaveBeenCalledWith(
+			expect.objectContaining({ originalLength: buried.length, limit: 100 }),
+		);
+	});
 });
 
 describe('sanitizeMcpJsonSchemaDescriptions', () => {

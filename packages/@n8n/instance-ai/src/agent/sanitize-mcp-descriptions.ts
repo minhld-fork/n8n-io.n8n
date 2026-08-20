@@ -28,6 +28,14 @@ export const MCP_SCHEMA_DESCRIPTION_MAX_LENGTH = 4_096;
 
 const TRUNCATION_MARKER = '… [truncated]';
 
+/**
+ * How much of a description the strip passes are handed, as a multiple of the
+ * cap. They cost time linear in their input, and text past this window cannot
+ * survive the cap anyway — only a description that is mostly strippable noise
+ * loses anything it would otherwise have kept.
+ */
+const SCAN_LIMIT_FACTOR = 4;
+
 /** C0/C1 control characters, keeping tab and newline. */
 // eslint-disable-next-line no-control-regex -- stripping control characters is the point
 const CONTROL_CHARACTER_PATTERN = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g;
@@ -39,6 +47,7 @@ const DESCRIPTION_KEYWORDS = new Set(['description', 'title']);
 export interface McpDescriptionTruncation {
 	toolName?: string;
 	path: string;
+	/** Length of the text as the server sent it, before stripping. */
 	originalLength: number;
 	limit: number;
 }
@@ -60,17 +69,23 @@ export function sanitizeMcpDescription(
 	maxLength: number,
 	context: SanitizeDescriptionContext = { path: '$' },
 ): string {
-	const stripped = sanitizeWebContent(value.replace(/\r\n?/g, '\n'))
+	// Bound the input first: a server can send megabytes here, and every pass
+	// below walks whatever it is handed.
+	const scanLimit = maxLength * SCAN_LIMIT_FACTOR;
+	const scanned = value.length > scanLimit ? value.slice(0, scanLimit) : value;
+
+	const stripped = sanitizeWebContent(scanned.replace(/\r\n?/g, '\n'))
 		.replace(CONTROL_CHARACTER_PATTERN, '')
 		.replace(/\n{3,}/g, '\n\n')
 		.trim();
 
-	if (stripped.length <= maxLength) return stripped;
+	// A dropped tail counts as truncation even when what survived stripping fits.
+	if (stripped.length <= maxLength && scanned.length === value.length) return stripped;
 
 	context.report?.({
 		toolName: context.toolName,
 		path: context.path,
-		originalLength: stripped.length,
+		originalLength: value.length,
 		limit: maxLength,
 	});
 	// Drop a trailing high surrogate: slicing cuts UTF-16 code units, so a cap
